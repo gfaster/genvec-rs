@@ -66,18 +66,20 @@ impl<'a, T> Weak<'a, T> {
         let inner = unsafe { &*cell.get() }.as_ref()?;
         if inner.epoch != self.epoch { return None }
 
+        inner.refs.set(inner.refs.get() + 1);
         Some(GenRef { index: self.index, source: self.source })
     }
 }
 
 impl<T> GenVec<T> {
     /// create a new [`GenVec`] with the capacity to hold `capacity` objects
+    #[inline]
     pub fn new(capacity: usize) -> Self {
         Self {
             generation: 1.into(),
             free: capacity.into(),
             capacity,
-            data: Vec::from_iter(std::iter::repeat_with(|| None.into()))
+            data: Vec::from_iter(std::iter::repeat_with(|| None.into()).take(capacity))
         }
     }
 
@@ -193,5 +195,62 @@ impl<'a, T> GenRef<'a, T> {
             epoch,
             source: self.source,
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn allocate_single() {
+        let allocator = GenVec::new(1);
+        let item = allocator.alloc(42).unwrap();
+        assert_eq!(*item, 42)
+    }
+
+    #[test]
+    fn make_weak_reference() {
+        let allocator = GenVec::new(1);
+        let item = allocator.alloc(42).unwrap();
+        let weak = item.weak();
+        assert_eq!(*weak.upgrade().unwrap(), 42);
+        std::mem::drop(item)
+    }
+
+
+    #[test]
+    fn no_strong_references_invalidates_weak_references() {
+        let allocator = GenVec::new(1);
+        let item = allocator.alloc(42).unwrap();
+        let weak = item.weak();
+        std::mem::drop(item);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn strong_references_keep_alive() {
+        let allocator = GenVec::new(1);
+        let item = allocator.alloc(42).unwrap();
+        let weak = item.weak();
+        let item_dup = item.clone();
+        std::mem::drop(item);
+        assert_eq!(*item_dup, 42);
+        assert_eq!(*weak.upgrade().unwrap(), 42);
+        std::mem::drop(item_dup);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn dropping_reference_frees_space() {
+        let allocator = GenVec::new(1);
+        let item = allocator.alloc(42).unwrap();
+
+        assert!(allocator.alloc(33).is_err());
+
+        std::mem::drop(item);
+
+        let item = allocator.alloc(23).unwrap();
+        assert_eq!(*item, 23)
     }
 }
