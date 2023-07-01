@@ -253,4 +253,15 @@ mod test {
         let item = allocator.alloc(23).unwrap();
         assert_eq!(*item, 23)
     }
+
+    #[test]
+    fn weak_reference_fails_on_replacement() {
+        let allocator = GenVec::new(1);
+        let item = allocator.alloc(42).unwrap();
+        let weak = item.weak();
+        std::mem::drop(item);
+        let new_item = allocator.alloc(33).unwrap();
+        assert!(weak.upgrade().is_none());
+        std::mem::drop(new_item)
+    }
 }
