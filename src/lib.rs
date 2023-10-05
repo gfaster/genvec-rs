@@ -5,7 +5,7 @@
 //! arena allocators
 
 mod simple;
-mod sync;
+// mod sync;
 
 pub use simple::*;
 

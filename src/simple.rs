@@ -10,8 +10,6 @@ pub struct GenVec<T> {
     /// current generation of the allocator
     generation: Cell<usize>,
 
-    /// number of free slots
-    free: Cell<usize>,
 
     /// number of total slots. Can only be changed with an exclusive reference due to the
     /// possibility of dangling pointers. Consider the following sequence:
@@ -22,6 +20,12 @@ pub struct GenVec<T> {
     /// 4. reference created in step 2 is now invalid
     capacity: usize,
 
+    /// number of free slots, this is different from `free_slots.len()` since that does not change
+    free: Cell<usize>,
+
+    /// len should always == `capacity`
+    free_ptr: Vec<Cell<usize>>,
+    free_ind: Vec<Cell<usize>>,
 
     /// underlying data of the GenVec.
     data: Vec<UnsafeCell<Option<Inner<T>>>>
@@ -30,18 +34,15 @@ pub struct GenVec<T> {
 struct Inner<T> {
     epoch: usize,
 
-    /// Number of strong references to this cell. If this is greater than zero, then there may
-    /// exist pointers to the item.
-    ///
-    /// This is a Cell because it must be able to be mutated while references exist to the item -
-    /// and thus creating a mutable reference to all of Inner would be illegal
+    /// Number of strong references to this cell. I may change this to mimic refcell semantics.
     refs: Cell<usize>,
 
+    /// stored item, may change to `UnsafeCell` if I want to make this a RefCell.
     item: T,
 }
 
 /// Strong reference to an item
-pub struct GenRef<'a, T> {
+pub struct Ref<'a, T> {
     index: usize,
     source: &'a GenVec<T>,
 }
@@ -58,16 +59,18 @@ impl<'a, T> Weak<'a, T> {
     #[inline]
     /// Attempt to upgrade to a [`GenRef`]. Will return [`None`] if the referenced item has been
     /// dropped
-    pub fn upgrade(self) -> Option<GenRef<'a, T>> {
+    pub fn upgrade(self) -> Option<Ref<'a, T>> {
         let cell = self.source.data.get(self.index)?;
 
         // Safety: while there may be other shared references to the item, there are no
         // mutable aliases (unless T contains an UnsafeCell, but that's ok too).
+        // 
+        // if this were multithreaded, there would be a race condition with the ref increment
         let inner = unsafe { &*cell.get() }.as_ref()?;
         if inner.epoch != self.epoch { return None }
 
         inner.refs.set(inner.refs.get() + 1);
-        Some(GenRef { index: self.index, source: self.source })
+        Some(Ref { index: self.index, source: self.source })
     }
 }
 
@@ -77,8 +80,11 @@ impl<T> GenVec<T> {
     pub fn new(capacity: usize) -> Self {
         Self {
             generation: 1.into(),
-            free: capacity.into(),
             capacity,
+            free: capacity.into(),
+            // TODO: try benchmarking reversing this iterator
+            free_ptr: Vec::from_iter((0..capacity).map(|x| x.into())),
+            free_ind: Vec::from_iter((0..capacity).map(|x| x.into())),
             data: Vec::from_iter(std::iter::repeat_with(|| None.into()).take(capacity))
         }
     }
@@ -88,28 +94,33 @@ impl<T> GenVec<T> {
     /// if the allocation fails due to lack of capacity, the item will be returned in the `Err()`
     /// variant
     #[must_use]
-    pub fn alloc(&self, item: T) -> Result<GenRef<T>, T>{
+    pub fn alloc(&self, item: T) -> Result<Ref<T>, T>{
         let position;
 
-        if self.free.get() > 0 {
-            position = self.data.iter().position(|x| {
-                // Safety: while there may be other shared references to the item, there are no
-                // mutable aliases (unless T contains an UnsafeCell, but that's ok too).
-                unsafe { &*x.get() }.is_none()
-            }).expect("genvec should have free slots, but none were found");
-        } else {
+        // this should be fine for all non-pathological programs
+        let gen = self.generation.get().wrapping_add(1);
+
+        let free = self.free.get();
+        if free == 0 {
             return Err(item)
         }
 
-        let inner = Inner { epoch: self.generation.get(), refs: 1.into(), item };
-        self.generation.set(self.generation.get() + 1);
+        // We don't need to update (can just leave junk data in) free_ptr and free_ind since we
+        // always just take from the end and we never check residency (that's done by the
+        // Option<Inner>). It is sufficient to simply decrement the len.
+        self.free.set(free - 1);
+        position = self.free_ind[free - 1].get();
+
+        // Safety: we can take a shared reference to the slot
+        debug_assert!(unsafe {&*self.data[position].get()}.is_none(), "Free for slot {position} was lost");
+
+        let inner = Inner { epoch: gen, refs: 1.into(), item };
+        self.generation.set(gen);
 
         // Safety: the item in the slot will have no references to the inner type
         unsafe { *self.data[position].get() = Some(inner) };
 
-        self.free.set(self.free.get() - 1);
-
-        Ok(GenRef { index: position, source: self })
+        Ok(Ref { index: position, source: self })
     }
 
     /// change the capacity of the GenVec
@@ -138,7 +149,7 @@ impl<T> GenVec<T> {
     }
 }
 
-impl<T> Deref for GenRef<'_, T> {
+impl<T> Deref for Ref<'_, T> {
     type Target = T;
 
     #[inline]
@@ -150,7 +161,7 @@ impl<T> Deref for GenRef<'_, T> {
     }
 }
 
-impl<T> Clone for GenRef<'_, T> {
+impl<T> Clone for Ref<'_, T> {
     #[inline]
     fn clone(&self) -> Self {
         // Safety: there are no mutable references to self.source and there will never be a mutable
@@ -165,7 +176,7 @@ impl<T> Clone for GenRef<'_, T> {
     }
 }
 
-impl<T> Drop for GenRef<'_, T>  {
+impl<T> Drop for Ref<'_, T>  {
     fn drop(&mut self) {
         // Safety: there are no mutable references to self. source and there will never be a mutable
         // reference to data.
@@ -176,15 +187,18 @@ impl<T> Drop for GenRef<'_, T>  {
 
         if refs.get() == 0 {
             // Safety: this is the last reference to the cell, so we can get a mutable reference
-            let cell = unsafe {&mut *self.source.data[self.index].get()};
-            *cell = None;
+            let cell = self.source.data[self.index].get();
+            unsafe { *cell = None };
 
-            self.source.free.set(self.source.free.get() + 1)
+            let free = self.source.free.get();
+            self.source.free_ind[free].set(self.index);
+            self.source.free_ptr[self.index].set(free);
+            self.source.free.set(free + 1);
         }
     }
 }
 
-impl<'a, T> GenRef<'a, T> {
+impl<'a, T> Ref<'a, T> {
     /// Create a weak reference
     pub fn weak(&'_ self) -> Weak<'a, T> {
         // Safety: there are no mutable references to the data and we do not leak the reference
@@ -263,5 +277,21 @@ mod test {
         let new_item = allocator.alloc(33).unwrap();
         assert!(weak.upgrade().is_none());
         std::mem::drop(new_item)
+    }
+
+    #[test]
+    fn fuzz() {
+        let size = 64;
+        let mut epoch = 0;
+        let mut rand = fastrand::Rng::with_seed(12345);
+        let allocator = GenVec::new(size);
+        let mut allocations = Vec::from_iter((0..size).map(|_| allocator.alloc({ epoch += 1; epoch})));
+        for _ in 0..200000 {
+            if allocations.len() == size || (allocations.len() > 0 && rand.bool()) {
+                let _ = allocations.swap_remove(rand.usize(0..allocations.len()));
+            } else {
+                allocations.push(allocator.alloc({epoch += 1; epoch}));
+            }
+        }
     }
 }
