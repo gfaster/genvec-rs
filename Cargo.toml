@@ -5,5 +5,12 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[dev-dependencies]
+[dependencies]
 fastrand = "2.0.1"
+
+[[bin]]
+name = "benchmark"
+path = "benchmarks/bench.rs"
+
+[profile.release]
+debug = true

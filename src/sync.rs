@@ -82,15 +82,26 @@ impl<'a, T> Weak<'a, T> {
             // something else here
             return None;
         };
-        if inner.refs.fetch_add(1, Ordering::AcqRel) == 0 {
-            inner.refs.fetch_sub(1, Ordering::Relaxed);
+        if inner.refs.fetch_update(Ordering::AcqRel, Ordering::Relaxed, |r| {
+            if r == 0 {
+                None
+            } else {
+                Some(r + 1)
+            }
+        }).is_err() {
             // has been dropped
             return None;
         };
         if inner.epoch.load(Ordering::Acquire) != self.epoch {
             // something else here - we check again to make sure nothing happened in between the
             // last two checks. 
-            inner.refs.fetch_sub(1, Ordering::Relaxed);
+            if inner.refs.fetch_sub(1, Ordering::Release) == 1 {
+                // after checking the epoch, another thread allocated in this slot. This thread
+                // then incremented the ref count, and the original thread dropped the last
+                // reference. However, since this thread incremented the reference count, the
+                // contained item was not dropped.
+                panic!("oh no, we leaked slot {}", self.index);
+            };
             return None;
         };
         // we've effectively locked the slot at this point
@@ -127,15 +138,18 @@ impl<T> GenVec<T> {
     /// variant
     #[must_use]
     pub fn alloc(&self, item: T) -> Result<Ref<T>, T>{
-        let Ok(_free) = self.free.fetch_update(Ordering::Acquire, Ordering::Relaxed, |f| f.checked_sub(1)) else {
+        let Ok(_free) = self.free.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |f| f.checked_sub(1)) else {
             return Err(item);
         };
-
         let idx = {
             loop { 
                 let head = self.free_head.load(Ordering::Acquire);
-                let next = self.data[head].next.load(Ordering::Relaxed);
-                let res = self.free_head.compare_exchange(head, next, Ordering::Release, Ordering::Relaxed);
+                let Some(next) = self.data.get(head).map(|s| s.next.load(Ordering::Acquire)) else {
+                    // head pointed out of bounds, I believe this is still valid, but I'm not
+                    // certain
+                    continue;
+                };
+                let res = self.free_head.compare_exchange(head, next, Ordering::AcqRel, Ordering::Relaxed);
                 match res {
                     Ok(_) => break head,
                     Err(_) => continue,
@@ -203,7 +217,7 @@ impl<T> Drop for Ref<'_, T>  {
         
         let slot = &self.source.data[self.index];
 
-        if slot.refs.fetch_sub(1, Ordering::Relaxed) == 1 {
+        if slot.refs.fetch_sub(1, Ordering::SeqCst) == 1 {
             // last ref
 
             // Safety: this is the last reference to this slot, and the data was initialized
@@ -212,14 +226,14 @@ impl<T> Drop for Ref<'_, T>  {
             // I'm not certain this is needed, but there is no data dependence between the drop and
             // re-adding self to the free list. If all memory accesses aren't persisted, there
             // could be a race condition in the partially-freed slot.
-            fence(Ordering::AcqRel);
+            fence(Ordering::SeqCst);
 
-            let _ = self.source.free_head.fetch_update(Ordering::Release, Ordering::Relaxed, |f| {
-                slot.next.store(f, Ordering::Release);
+            let _ = self.source.free_head.fetch_update(Ordering::SeqCst, Ordering::Relaxed, |f| {
+                slot.next.store(f, Ordering::SeqCst);
                 Some(self.index)
             });
 
-            self.source.free.fetch_add(1, Ordering::Release);
+            self.source.free.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
@@ -306,34 +320,39 @@ mod test {
 
     #[test]
     fn fuzz() {
-        let size = 64;
+        let size = 1 << 26;
 
         fn task(allocator: &GenVec<usize>, thread_id: usize, thread_cnt: usize, size: usize, epoch: &AtomicUsize) {
             let mut rand = fastrand::Rng::with_seed(12345 + thread_id as u64);
             let mut refs = Vec::from_iter((0..(2 * size / thread_cnt)).filter_map(|_| allocator.alloc( epoch.fetch_add(1, Ordering::Relaxed)).ok()));
             let mut weaks = Vec::with_capacity(3*size);
-            let mut cnt = 10000;
+            let mut cnt = 10_000_000;
             while cnt > 0 {
                 cnt -= 1;
-                match rand.u8(0..6) {
+                match rand.u8(0..=7) {
                     0 if refs.len() > 0 => {
                         let _ = refs.swap_remove(rand.usize(0..refs.len()));
                     },
-                    1..=2 if weaks.len() > 0 => {
+                    1 => (),
+                    2..=3 if weaks.len() > 0 => {
                         let (weak, expected): (Weak<usize>, _) = weaks.swap_remove(rand.usize(0..weaks.len()));
                         if let Some(tref) = weak.upgrade() {
                             assert_eq!(*tref, expected);
                         }
                     },
-                    3..=4 if weaks.len() < 3 * size && refs.len() > 0 => {
+                    4..=5 if weaks.len() < 3 * size && refs.len() > 0 => {
                         let tref = &refs[rand.usize(0..refs.len())];
                         weaks.push((tref.weak(), **tref));
                     },
-                    5 if refs.len() < size / 2 => {
+                    6 if refs.len() < size => {
                         let Ok(res) = allocator.alloc(epoch.fetch_add(1, Ordering::Relaxed)) else { continue };
                         refs.push(res);
                     },
-                    6.. => unreachable!(),
+                    7 if refs.len() < size && refs.len() > 0 => {
+                        let tref = &refs[rand.usize(0..refs.len())];
+                        refs.push(tref.clone());
+                    },
+                    8.. => unreachable!(),
                     _ => {
                         cnt += 1;
                     }
@@ -343,8 +362,8 @@ mod test {
         
         let epoch = AtomicUsize::new(0);
         let allocator = GenVec::new(size);
-        // let tcnt = std::thread::available_parallelism().map_or(4, |c| <usize as From<std::num::NonZeroUsize>>::from(c).max(4));
-        let tcnt = 8;
+        let tcnt = std::thread::available_parallelism().map_or(4, |c| <usize as From<std::num::NonZeroUsize>>::from(c).max(4));
+        // let tcnt = 8;
         let tids = Vec::from_iter(0..tcnt);
         std::thread::scope(|s| {
             for t in &tids {
