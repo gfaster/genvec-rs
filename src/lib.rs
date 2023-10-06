@@ -4,10 +4,10 @@
 
 //! arena allocators
 
-mod simple;
-// mod sync;
+// mod simple;
+mod sync;
 
-pub use simple::*;
+// pub use simple::*;
 
 // epoch based allocator that allows arbitrary numbers of weak references
 

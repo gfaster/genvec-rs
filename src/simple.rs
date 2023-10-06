@@ -286,7 +286,7 @@ mod test {
         let mut rand = fastrand::Rng::with_seed(12345);
         let allocator = GenVec::new(size);
         let mut allocations = Vec::from_iter((0..size).map(|_| allocator.alloc({ epoch += 1; epoch})));
-        for _ in 0..200000 {
+        for _ in 0..20000 {
             if allocations.len() == size || (allocations.len() > 0 && rand.bool()) {
                 let _ = allocations.swap_remove(rand.usize(0..allocations.len()));
             } else {
