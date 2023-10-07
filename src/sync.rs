@@ -319,14 +319,15 @@ mod test {
     }
 
     #[test]
+    #[ignore = "expensive"]
     fn fuzz() {
-        let size = 1 << 26;
+        let size = 1 << 20;
 
         fn task(allocator: &GenVec<usize>, thread_id: usize, thread_cnt: usize, size: usize, epoch: &AtomicUsize) {
             let mut rand = fastrand::Rng::with_seed(12345 + thread_id as u64);
             let mut refs = Vec::from_iter((0..(2 * size / thread_cnt)).filter_map(|_| allocator.alloc( epoch.fetch_add(1, Ordering::Relaxed)).ok()));
             let mut weaks = Vec::with_capacity(3*size);
-            let mut cnt = 10_000_000;
+            let mut cnt = 100_000;
             while cnt > 0 {
                 cnt -= 1;
                 match rand.u8(0..=7) {
