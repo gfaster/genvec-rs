@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicUsize;
 
 
 fn fuzz() {
-    let size = 1 << 26;
+    let size = 300 * 12;
 
     fn task(allocator: &sync::GenVec<usize>, thread_id: usize, thread_cnt: usize, size: usize, epoch: &AtomicUsize) {
         let mut rand = fastrand::Rng::with_seed(12345 + thread_id as u64);
@@ -47,9 +47,9 @@ fn fuzz() {
     }
 
     let epoch = AtomicUsize::new(0);
-    let allocator = sync::GenVec::new(size);
     let tcnt = std::thread::available_parallelism().map_or(4, |c| <usize as From<std::num::NonZeroUsize>>::from(c).max(4));
     // let tcnt = 8;
+    let allocator = sync::GenVec::new(size / tcnt, tcnt);
     let tids = Vec::from_iter(0..tcnt);
     std::thread::scope(|s| {
         for t in &tids {
@@ -202,9 +202,9 @@ fn fuzz_single_alloc() {
 const ITER_CNT_SINGLE: i64 = 10_000;
 const SIZE_SINGLE: usize = 1000;
 fn main() {
-    fuzz_single()
+    // fuzz_single()
     // fuzz_single_alloc()
-    // fuzz()
+    fuzz()
     // fuzz_alloc()
 }
 

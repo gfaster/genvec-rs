@@ -21,11 +21,11 @@ pub struct GenVec<T> {
     /// 4. reference created in step 2 is now invalid
     capacity: usize,
 
-    /// number of free slots, this is different from `free_slots.len()` since that does not change
+    /// number of free slots
     free: Cell<usize>,
+    /// index of head of free list
     free_head: Cell<usize>,
 
-    /// underlying data of the GenVec.
     data: Vec<Inner<T>>
 }
 
@@ -37,7 +37,7 @@ struct Inner<T> {
     /// Number of strong references to this cell. I may change this to mimic refcell semantics.
     refs: Cell<usize>,
 
-    /// stored item, may change to `UnsafeCell` if I want to make this a RefCell.
+    /// stored item
     item: UnsafeCell<MaybeUninit<T>>,
 }
 
