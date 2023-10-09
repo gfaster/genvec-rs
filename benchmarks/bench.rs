@@ -1,121 +1,234 @@
 #![allow(dead_code)]
-use genvec::sync::Weak;
-use std::{sync::atomic::Ordering, sync::Arc, rc::Rc};
 use genvec::*;
-use std::sync::atomic::AtomicUsize;
+use std::{
+    ops::Deref,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
+macro_rules! inc {
+    ($var:expr) => {{
+        $var = $var.wrapping_add(1);
+        $var
+    }};
+}
 
-fn fuzz() {
-    let size = 300 * 12;
+mod traits {
+    use super::*;
 
-    fn task(allocator: &sync::GenVec<usize>, thread_id: usize, thread_cnt: usize, size: usize, epoch: &AtomicUsize) {
-        let mut rand = fastrand::Rng::with_seed(12345 + thread_id as u64);
-        let mut refs = Vec::from_iter((0..(2 * size / thread_cnt)).filter_map(|_| allocator.alloc( epoch.fetch_add(1, Ordering::Relaxed)).ok()));
-        let mut weaks = Vec::with_capacity(3*size);
-        let mut cnt = 100_000;
-        while cnt > 0 {
-            cnt -= 1;
-            match rand.u8(0..=7) {
-                0 if refs.len() > 0 => {
-                    let _ = refs.swap_remove(rand.usize(0..refs.len()));
-                },
-                1 => (),
-                2..=3 if weaks.len() > 0 => {
-                    let (weak, expected): (Weak<usize>, _) = weaks.swap_remove(rand.usize(0..weaks.len()));
-                    if let Some(tref) = weak.upgrade() {
-                        assert_eq!(*tref, expected);
-                    }
-                },
-                4..=5 if weaks.len() < 3 * size && refs.len() > 0 => {
-                    let tref = &refs[rand.usize(0..refs.len())];
-                    weaks.push((tref.weak(), **tref));
-                },
-                6 if refs.len() < size => {
-                    let Ok(res) = allocator.alloc(epoch.fetch_add(1, Ordering::Relaxed)) else { continue };
-                    refs.push(res);
-                },
-                7 if refs.len() < size && refs.len() > 0 => {
-                    let tref = &refs[rand.usize(0..refs.len())];
-                    refs.push(tref.clone());
-                },
-                8.. => unreachable!(),
-                _ => {
-                    cnt += 1;
-                }
-            };
+    pub trait Allocator<'a, T, P>
+    where
+        P: RefCountPtr<'a, T>,
+    {
+        fn alloc(&'a self, val: T) -> Option<P>;
+    }
+
+    impl<'a, T> Allocator<'a, T, sync::Ref<'a, T>> for sync::GenVec<T> {
+        fn alloc(&'a self, val: T) -> Option<sync::Ref<'a, T>> {
+            sync::GenVec::<T>::alloc(self, val).ok()
         }
     }
 
-    let epoch = AtomicUsize::new(0);
-    let tcnt = std::thread::available_parallelism().map_or(4, |c| <usize as From<std::num::NonZeroUsize>>::from(c).max(4));
-    // let tcnt = 8;
-    let allocator = sync::GenVec::new(size / tcnt, tcnt);
+    impl<'a, T, P> Allocator<'a, T, P> for ()
+    where
+        P: RefCountPtr<'a, T>,
+    {
+        fn alloc(&'a self, _val: T) -> Option<P> {
+            None
+        }
+    }
+
+    pub trait RefCountWeak<'alloc, T, S: RefCountPtr<'alloc, T, Weak = Self>>: Clone {
+        fn upgrade(&self) -> Option<S>;
+    }
+
+    impl<'alloc, T> RefCountWeak<'alloc, T, Arc<T>> for std::sync::Weak<T> {
+        fn upgrade(&self) -> Option<Arc<T>> {
+            self.upgrade()
+        }
+    }
+
+    impl<'alloc, T> RefCountWeak<'alloc, T, sync::Ref<'alloc, T>> for sync::Weak<'alloc, T> {
+        fn upgrade(&self) -> Option<sync::Ref<'alloc, T>> {
+            sync::Weak::upgrade(*self)
+        }
+    }
+
+    pub trait RefCountPtr<'alloc, T>: Clone + Deref<Target = T> {
+        type Weak: RefCountWeak<'alloc, T, Self>;
+
+        fn make_weak(&self) -> Self::Weak;
+        fn new<A>(allocator: &'alloc A, val: T) -> Option<Self>
+        where
+            A: Allocator<'alloc, T, Self>;
+    }
+
+    impl<'alloc, T> RefCountPtr<'alloc, T> for Arc<T> {
+        type Weak = std::sync::Weak<T>;
+
+        fn make_weak(&self) -> Self::Weak {
+            Arc::downgrade(self)
+        }
+
+        fn new<A>(_allocator: &'alloc A, val: T) -> Option<Self>
+        where
+            A: Allocator<'alloc, T, Self>,
+        {
+            Some(Arc::new(val))
+        }
+    }
+
+    impl<'alloc, T> RefCountPtr<'alloc, T> for sync::Ref<'alloc, T> {
+        type Weak = sync::Weak<'alloc, T>;
+
+        fn make_weak(&self) -> Self::Weak {
+            Self::weak(self)
+        }
+
+        fn new<A>(allocator: &'alloc A, val: T) -> Option<Self>
+        where
+            A: Allocator<'alloc, T, Self>,
+        {
+            allocator.alloc(val)
+        }
+    }
+}
+use traits::*;
+
+fn task<'a, A, T, R, W, F>(
+    allocator: &'a A,
+    rand: &mut fastrand::Rng,
+    refs: &mut Vec<R>,
+    weaks: &mut Vec<(W, T)>,
+    size: usize,
+    val: F,
+) -> bool
+where
+    T: Clone,
+    F: FnOnce() -> T,
+    T: std::fmt::Debug + Eq,
+    R: RefCountPtr<'a, T, Weak = W>,
+    W: RefCountWeak<'a, T, R>,
+    A: Allocator<'a, T, R>,
+{
+    match rand.u8(0..=7) {
+        0 if refs.len() > 0 => {
+            let _ = refs.swap_remove(rand.usize(0..refs.len()));
+        }
+        1 => (),
+        2..=3 if weaks.len() > 0 => {
+            let (weak, expected): (W, _) = weaks.swap_remove(rand.usize(0..weaks.len()));
+            if let Some(tref) = weak.upgrade() {
+                assert_eq!(*tref, expected);
+            }
+        }
+        4..=5 if weaks.len() < 3 * size && refs.len() > 0 => {
+            let tref = &refs[rand.usize(0..refs.len())];
+            weaks.push((tref.make_weak(), (**tref).clone()));
+        }
+        6 if refs.len() < size => {
+            let Some(res) = R::new(allocator, val()) else {
+                return false;
+            };
+            refs.push(res);
+        }
+        7 if refs.len() < size && refs.len() > 0 => {
+            let tref = &refs[rand.usize(0..refs.len())];
+            refs.push(tref.clone());
+        }
+        8.. => unreachable!(),
+        _ => {
+            return false;
+        }
+    };
+    return true;
+}
+
+fn fuzz() {
+    type Item = Box<usize>;
+    fn ttask<'a>(
+        allocator: &'a sync::GenVec<Item>,
+        avec: &[Mutex<(Vec<(sync::Weak<'a, Item>, Item)>, Vec<sync::Ref<'a, Item>>)>],
+        thread_id: usize,
+        size: usize,
+    ) {
+        let mut rand = fastrand::Rng::with_seed(12345 + thread_id as u64);
+        let mut epoch = rand.usize(..);
+        let mut cnt = ITER_CNT_SYNC;
+        while cnt > 0 {
+            let mut lock = match avec[rand.usize(0..(avec.len()))].lock() {
+                Ok(l) => l,
+                Err(poison) => panic!("poison: {poison}"),
+            };
+            let (weaks, refs) = &mut *lock;
+            let res = task(allocator, &mut rand, refs, weaks, size, || {
+                inc!(epoch).into()
+            });
+            drop(lock);
+            if res {
+                cnt -= 1
+            }
+        }
+    }
+
+    // let tcnt = std::thread::available_parallelism().map_or(4, |c| <usize as From<std::num::NonZeroUsize>>::from(c).max(4));
+    let tcnt = THREAD_CNT_SYNC;
+    let allocator = sync::GenVec::new(SIZE_SYNC / tcnt, tcnt);
     let tids = Vec::from_iter(0..tcnt);
+    let mut epoch: usize = 0;
+    let arenas = Vec::from_iter((0..(tcnt * 16)).map(|_| {
+        Mutex::new((
+            Vec::with_capacity(3 * SIZE_SYNC),
+            Vec::from_iter(
+                (0..(2 * SIZE_SYNC / tcnt)).filter_map(|_| allocator.alloc(inc!(epoch).into()).ok()),
+            ),
+        ))
+    }));
     std::thread::scope(|s| {
         for t in &tids {
-            s.spawn(|| task(&allocator, *t, tcnt, size, &epoch));
-        };
+            s.spawn(|| ttask(&allocator, (&arenas).as_slice(), *t, SIZE_SYNC));
+        }
     });
 }
 
 fn fuzz_alloc() {
-    let size = 1 << 26;
-
-    fn task(thread_id: usize, thread_cnt: usize, size: usize, epoch: &AtomicUsize) {
+    fn ttask(thread_id: usize, thread_cnt: usize, size: usize) {
         let mut rand = fastrand::Rng::with_seed(12345 + thread_id as u64);
-        let mut refs = Vec::from_iter((0..(2 * size / thread_cnt)).map(|_| Arc::new(epoch.fetch_add(1, Ordering::Relaxed))));
-        let mut weaks = Vec::with_capacity(3*size);
-        let mut cnt = 100_000;
+        let mut epoch = rand.usize(..);
+        let mut refs = Vec::from_iter((0..(2 * size / thread_cnt)).map(|_| Arc::new(inc!(epoch))));
+        let mut weaks = Vec::with_capacity(3 * size);
+        let mut cnt = ITER_CNT_SYNC;
         while cnt > 0 {
-            cnt -= 1;
-            match rand.u8(0..=7) {
-                0 if refs.len() > 0 => {
-                    let _ = refs.swap_remove(rand.usize(0..refs.len()));
-                },
-                1 => (),
-                2..=3 if weaks.len() > 0 => {
-                    let (weak, expected): (std::sync::Weak<usize>, _) = weaks.swap_remove(rand.usize(0..weaks.len()));
-                    if let Some(tref) = weak.upgrade() {
-                        assert_eq!(*tref, expected);
-                    }
-                },
-                4..=5 if weaks.len() < 3 * size && refs.len() > 0 => {
-                    let tref = &refs[rand.usize(0..refs.len())];
-                    weaks.push((Arc::downgrade(tref), **tref));
-                },
-                6 if refs.len() < size => {
-                    refs.push(Arc::new(epoch.fetch_add(1, Ordering::Relaxed)));
-                },
-                7 if refs.len() < size && refs.len() > 0 => {
-                    let tref = &refs[rand.usize(0..refs.len())];
-                    refs.push(tref.clone());
-                },
-                8.. => unreachable!(),
-                _ => {
-                    cnt += 1;
-                }
-            };
+            let res = task(&(), &mut rand, &mut refs, &mut weaks, size, || inc!(epoch));
+            if res {
+                cnt -= 1;
+            }
         }
     }
 
-    let epoch = AtomicUsize::new(0);
-    let tcnt = std::thread::available_parallelism().map_or(4, |c| <usize as From<std::num::NonZeroUsize>>::from(c).max(4));
-    // let tcnt = 8;
+    // let tcnt = std::thread::available_parallelism().map_or(4, |c| <usize as From<std::num::NonZeroUsize>>::from(c).max(4));
+    let tcnt = THREAD_CNT_SYNC;
     let tids = Vec::from_iter(0..tcnt);
     std::thread::scope(|s| {
         for t in &tids {
-            s.spawn(|| task(*t, tcnt, size, &epoch));
-        };
+            s.spawn(|| ttask(*t, tcnt, SIZE_SYNC));
+        }
     });
 }
-
 
 fn fuzz_single() {
     let allocator = simple::GenVec::new(SIZE_SINGLE);
     let mut epoch = 0;
     let mut rand = fastrand::Rng::with_seed(12345);
-    let mut refs = Vec::from_iter((0..(SIZE_SINGLE / 2)).map(|_| allocator.alloc({epoch += 1; epoch}).unwrap()));
-    let mut weaks = Vec::with_capacity(3*SIZE_SINGLE);
+    let mut refs = Vec::from_iter((0..(SIZE_SINGLE / 2)).map(|_| {
+        allocator
+            .alloc({
+                epoch += 1;
+                epoch
+            })
+            .unwrap()
+    }));
+    let mut weaks = Vec::with_capacity(3 * SIZE_SINGLE);
     let mut remain = ITER_CNT_SINGLE;
     let mut cnt = 0;
     while remain > 0 {
@@ -127,26 +240,32 @@ fn fuzz_single() {
         match rand.u8(0..=7) {
             0..=1 if refs.len() > 0 => {
                 let _ = refs.swap_remove(rand.usize(0..refs.len()));
-            },
+            }
             // 1 => (),
             2..=3 if weaks.len() > 0 => {
-                let (weak, expected): (simple::Weak<usize>, _) = weaks.swap_remove(rand.usize(0..weaks.len()));
+                let (weak, expected): (simple::Weak<usize>, _) =
+                    weaks.swap_remove(rand.usize(0..weaks.len()));
                 if let Some(tref) = weak.upgrade() {
                     assert_eq!(*tref, expected);
                 }
-            },
+            }
             4..=5 if weaks.len() < 3 * SIZE_SINGLE && refs.len() > 0 => {
                 let tref = &refs[rand.usize(0..refs.len())];
                 weaks.push((tref.weak(), **tref));
-            },
+            }
             6 if refs.len() < SIZE_SINGLE => {
-                let res = allocator.alloc({epoch +=1; epoch}).unwrap();
+                let res = allocator
+                    .alloc({
+                        epoch += 1;
+                        epoch
+                    })
+                    .unwrap();
                 refs.push(res);
-            },
+            }
             7 if refs.len() < SIZE_SINGLE && refs.len() > 0 => {
                 let tref = &refs[rand.usize(0..refs.len())];
                 refs.push(tref.clone());
-            },
+            }
             8.. => unreachable!(),
             _ => {
                 remain += 1;
@@ -158,8 +277,11 @@ fn fuzz_single() {
 fn fuzz_single_alloc() {
     let mut epoch = 0;
     let mut rand = fastrand::Rng::with_seed(12345);
-    let mut refs = Vec::from_iter((0..(SIZE_SINGLE / 2)).map(|_| {epoch += 1; Rc::new(epoch)}));
-    let mut weaks = Vec::with_capacity(3*SIZE_SINGLE);
+    let mut refs = Vec::from_iter((0..(SIZE_SINGLE / 2)).map(|_| {
+        epoch += 1;
+        Rc::new(epoch)
+    }));
+    let mut weaks = Vec::with_capacity(3 * SIZE_SINGLE);
     let mut remain = ITER_CNT_SINGLE;
     let mut cnt = 0;
     while remain > 0 {
@@ -171,26 +293,30 @@ fn fuzz_single_alloc() {
         match rand.u8(0..=7) {
             0..=1 if refs.len() > 0 => {
                 let _ = refs.swap_remove(rand.usize(0..refs.len()));
-            },
+            }
             // 1 => (),
             2..=3 if weaks.len() > 0 => {
-                let (weak, expected): (std::rc::Weak<usize>, _) = weaks.swap_remove(rand.usize(0..weaks.len()));
+                let (weak, expected): (std::rc::Weak<usize>, _) =
+                    weaks.swap_remove(rand.usize(0..weaks.len()));
                 if let Some(tref) = weak.upgrade() {
                     assert_eq!(*tref, expected);
                 }
-            },
+            }
             4..=5 if weaks.len() < 3 * SIZE_SINGLE && refs.len() > 0 => {
                 let tref = &refs[rand.usize(0..refs.len())];
                 weaks.push((Rc::downgrade(tref), **tref));
-            },
+            }
             6 if refs.len() < SIZE_SINGLE => {
-                let res = Rc::new({epoch +=1; epoch});
+                let res = Rc::new({
+                    epoch += 1;
+                    epoch
+                });
                 refs.push(res);
-            },
+            }
             7 if refs.len() < SIZE_SINGLE && refs.len() > 0 => {
                 let tref = &refs[rand.usize(0..refs.len())];
                 refs.push(tref.clone());
-            },
+            }
             8.. => unreachable!(),
             _ => {
                 remain += 1;
@@ -201,10 +327,13 @@ fn fuzz_single_alloc() {
 
 const ITER_CNT_SINGLE: i64 = 10_000;
 const SIZE_SINGLE: usize = 1000;
+
+const THREAD_CNT_SYNC: usize = 12;
+const ITER_CNT_SYNC: i64 = 100_000_000;
+const SIZE_SYNC: usize = 1000;
 fn main() {
     // fuzz_single()
     // fuzz_single_alloc()
     fuzz()
     // fuzz_alloc()
 }
-

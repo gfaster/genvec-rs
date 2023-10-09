@@ -1,5 +1,8 @@
 use std::mem::MaybeUninit;
-use std::{cell::{Cell, UnsafeCell}, ops::Deref};
+use std::{
+    cell::{Cell, UnsafeCell},
+    ops::Deref,
+};
 
 /// Simple allocator for many identical objects with unknown lifetimes
 ///
@@ -10,7 +13,6 @@ use std::{cell::{Cell, UnsafeCell}, ops::Deref};
 pub struct GenVec<T> {
     /// current generation of the allocator
     generation: Cell<usize>,
-
 
     /// number of total slots. Can only be changed with an exclusive reference due to the
     /// possibility of dangling pointers. Consider the following sequence:
@@ -26,7 +28,7 @@ pub struct GenVec<T> {
     /// index of head of free list
     free_head: Cell<usize>,
 
-    data: Vec<Inner<T>>
+    data: Vec<Inner<T>>,
 }
 
 struct Inner<T> {
@@ -62,11 +64,18 @@ impl<'a, T> Weak<'a, T> {
     pub fn upgrade(self) -> Option<Ref<'a, T>> {
         let inner = self.source.data.get(self.index)?;
 
-        if inner.epoch.get() != self.epoch { return None }
-        if inner.refs.get() == 0 { return None }
+        if inner.epoch.get() != self.epoch {
+            return None;
+        }
+        if inner.refs.get() == 0 {
+            return None;
+        }
 
         inner.refs.set(inner.refs.get() + 1);
-        Some(Ref { index: self.index, source: self.source })
+        Some(Ref {
+            index: self.index,
+            source: self.source,
+        })
     }
 }
 
@@ -79,10 +88,12 @@ impl<T> GenVec<T> {
             capacity,
             free: capacity.into(),
             free_head: 0.into(),
-            data: Vec::from_iter(
-                (0..capacity).map(|i| Inner { next: (i + 1).into(), epoch: 0.into(), refs:
-                    0.into(), item: MaybeUninit::uninit().into() })
-            )
+            data: Vec::from_iter((0..capacity).map(|i| Inner {
+                next: (i + 1).into(),
+                epoch: 0.into(),
+                refs: 0.into(),
+                item: MaybeUninit::uninit().into(),
+            })),
         }
     }
 
@@ -91,13 +102,13 @@ impl<T> GenVec<T> {
     /// if the allocation fails due to lack of capacity, the item will be returned in the `Err()`
     /// variant
     #[must_use]
-    pub fn alloc(&self, item: T) -> Result<Ref<T>, T>{
+    pub fn alloc(&self, item: T) -> Result<Ref<T>, T> {
         // this should be fine for all non-pathological programs
         let gen = self.generation.get().wrapping_add(1);
 
         let free = self.free.get();
         if free == 0 {
-            return Err(item)
+            return Err(item);
         }
 
         // We don't need to update (can just leave junk data in) free_ptr and free_ind since we
@@ -116,7 +127,10 @@ impl<T> GenVec<T> {
         // Safety: this is the only pointer to this free cell
         unsafe { (&mut *inner.item.get()).write(item) };
 
-        Ok(Ref { index: pos, source: self })
+        Ok(Ref {
+            index: pos,
+            source: self,
+        })
     }
 
     /// gets the maximum capacity
@@ -130,7 +144,7 @@ impl<T> GenVec<T> {
     pub fn free(&self) -> usize {
         self.free.get()
     }
-    
+
     /// gets the number of objects in the GenVec
     #[inline]
     pub fn allocated(&self) -> usize {
@@ -145,7 +159,7 @@ impl<T> Deref for Ref<'_, T> {
     fn deref(&self) -> &Self::Target {
         // Safety: there are no mutable references to self.source and there will never be a mutable
         // reference to data, and strong references refer to initialized objects.
-        unsafe {(&*self.source.data[self.index].item.get()).assume_init_ref()}
+        unsafe { (&*self.source.data[self.index].item.get()).assume_init_ref() }
     }
 }
 
@@ -156,12 +170,12 @@ impl<T> Clone for Ref<'_, T> {
         refs.set(refs.get() + 1);
         Self {
             index: self.index,
-            source: self.source
+            source: self.source,
         }
     }
 }
 
-impl<T> Drop for Ref<'_, T>  {
+impl<T> Drop for Ref<'_, T> {
     fn drop(&mut self) {
         let cell = &self.source.data[self.index];
         let refs = &cell.refs;
@@ -170,7 +184,7 @@ impl<T> Drop for Ref<'_, T>  {
         if refs.get() == 0 {
             // Safety: this is the last reference to the cell, so we can get a mutable reference
             // and strong references imply the item is initialized
-            unsafe { (&mut *cell.item.get()).assume_init_drop()};
+            unsafe { (&mut *cell.item.get()).assume_init_drop() };
 
             let free = self.source.free.get();
             self.source.free.set(free + 1);
@@ -212,7 +226,6 @@ mod test {
         assert_eq!(*weak.upgrade().unwrap(), 42);
         std::mem::drop(item)
     }
-
 
     #[test]
     fn no_strong_references_invalidates_weak_references() {
@@ -269,8 +282,15 @@ mod test {
         let allocator = GenVec::new(size);
         let mut epoch = 0;
         let mut rand = fastrand::Rng::with_seed(12345);
-        let mut refs = Vec::from_iter((0..(size / 2)).map(|_| allocator.alloc({epoch += 1; epoch}).unwrap()));
-        let mut weaks = Vec::with_capacity(3*size);
+        let mut refs = Vec::from_iter((0..(size / 2)).map(|_| {
+            allocator
+                .alloc({
+                    epoch += 1;
+                    epoch
+                })
+                .unwrap()
+        }));
+        let mut weaks = Vec::with_capacity(3 * size);
         let mut remain = iter;
         let mut cnt = 0;
         while remain > 0 {
@@ -282,26 +302,32 @@ mod test {
             match rand.u8(0..=7) {
                 0..=1 if refs.len() > 0 => {
                     let _ = refs.swap_remove(rand.usize(0..refs.len()));
-                },
+                }
                 // 1 => (),
                 2..=3 if weaks.len() > 0 => {
-                    let (weak, expected): (Weak<usize>, _) = weaks.swap_remove(rand.usize(0..weaks.len()));
+                    let (weak, expected): (Weak<usize>, _) =
+                        weaks.swap_remove(rand.usize(0..weaks.len()));
                     if let Some(tref) = weak.upgrade() {
                         assert_eq!(*tref, expected);
                     }
-                },
+                }
                 4..=5 if weaks.len() < 3 * size && refs.len() > 0 => {
                     let tref = &refs[rand.usize(0..refs.len())];
                     weaks.push((tref.weak(), **tref));
-                },
+                }
                 6 if refs.len() < size => {
-                    let res = allocator.alloc({epoch +=1; epoch}).unwrap();
+                    let res = allocator
+                        .alloc({
+                            epoch += 1;
+                            epoch
+                        })
+                        .unwrap();
                     refs.push(res);
-                },
+                }
                 7 if refs.len() < size => {
                     let tref = &refs[rand.usize(0..refs.len())];
                     refs.push(tref.clone());
-                },
+                }
                 8.. => unreachable!(),
                 _ => {
                     remain += 1;
