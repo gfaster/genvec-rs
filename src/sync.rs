@@ -24,6 +24,9 @@ pub struct GenVec<T> {
 
     /// circularly linked list of arenas
     arena: AtomicPtr<ArenaNode<T>>,
+
+    /// the capacity of each arena
+    arena_cap: usize,
 }
 
 struct ArenaNode<T> {
@@ -47,7 +50,9 @@ impl<T> ArenaNode<T> {
     /// Try to increment the reference count of this slot, returning `Ok` if we locked in an
     /// active allocation and `Err` on failure. On success, `dec_ref()` will need to be called to
     /// properly release this reference. Nothing needs to be done on failure.
-    #[inline]
+    ///
+    /// Has at least `Acquire` ordering over the slot's `refs`.
+    #[inline(always)]
     fn try_inc_ref(&self, idx: usize) -> Result<(), ()> {
         let inner = &self.inner[idx];
         let prev = inner.refs.fetch_add(1, Ordering::Acquire);
@@ -63,52 +68,57 @@ impl<T> ArenaNode<T> {
         // this was an empty slot, at least at the time of incrementing. As far as we're concerned
         // now, even if another thread increments the ref count, the attempt still failed. However,
         // we still need to take care of freeing the object if the object was dropped in this time
-        // frame
-        self.dec_ref(idx);
+        // frame. There was nothing modified, so relax ordering decrement is fine.
+        self.dec_ref(idx, Ordering::Relaxed);
 
         return Err(());
     }
 
     /// decrements the ref count, drop+freeing the contained item if necessary.
-    ///
-    // FIXME: verify orderings
-    fn dec_ref(&self, idx: usize) {
+    #[inline(always)]
+    fn dec_ref(&self, idx: usize, ordering: Ordering) {
         let inner = &self.inner[idx];
-        let new_val = inner.refs.fetch_sub(1, Ordering::Relaxed) - 1;
+        let new_val = inner.refs.fetch_sub(1, ordering) - 1;
         // if the new value is has just the drop bit set, then the following holds:
         // 1) this is the last reference to an allocation
         // 2) the allocation is not in the free list
         // 3) it is not a given that this thread will be the one to free the allocation
         if new_val == Self::DROP_BIT {
-            // if just the drop bit is still set, then the following holds:
-            // 1) this thread will drop the item and add to the free list
-            // 2) there are no threads that can create a allocation reference
-            if inner
-                .refs
-                .compare_exchange(Self::DROP_BIT, 0, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                // The allocation was incremented from zero by another thread, it will be the one
-                // to drop this allocation
-                return;
-            }
-
-            // Safety: this thread won the drop privileges, and since the drop bit was set, the
-            // item is initialized. We atomically ensured that
-            unsafe { (&mut *inner.item.get()).assume_init_drop() };
-
-            // I'm uncertain which is faster here I might be able to just rely on the free count
-            // decrement at the end of the block.
-            // inner.refs.fetch_or(0, Ordering::Release);
-            std::sync::atomic::fence(Ordering::Release);
-
-            let mut lock = self.free_head.lock().expect("thread panicked");
-            // Safety: we have the allocation write lock
-            unsafe { inner.next.get().write(*lock) };
-            *lock = idx;
-            self.free_cnt.fetch_add(1, Ordering::Release);
-            drop(lock);
+            self.last_ref(inner, idx);
         }
+    }
+
+    /// slow path for `dec_ref`
+    fn last_ref(&self, inner: &Inner<T>, idx: usize) {
+        // if just the drop bit is still set, then the following holds:
+        // 1) this thread will drop the item and add to the free list
+        // 2) there are no threads that can create a allocation reference
+        if inner
+            .refs
+            .compare_exchange(Self::DROP_BIT, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            // The allocation was incremented from zero by another thread, it will be the one
+            // to drop this allocation
+            return;
+        }
+
+        // Safety: this thread won the drop privileges, and since the drop bit was set, the
+        // item is initialized. We atomically ensured that
+        unsafe { (&mut *inner.item.get()).assume_init_drop() };
+
+        // I'm uncertain which is faster here I might be able to just rely on the free count
+        // decrement at the end of the block.
+        // inner.refs.fetch_or(0, Ordering::Release);
+        std::sync::atomic::fence(Ordering::Release);
+
+        let mut lock = self.free_head.lock().expect("thread panicked");
+        // Safety: we have the allocation write lock
+        unsafe { inner.next.get().write(*lock) };
+        *lock = idx;
+        self.free_cnt.fetch_add(1, Ordering::Release);
+        drop(lock);
+
     }
 
     /// Creates a new arena and inserts it directly after the current head of the arena list, and
@@ -116,16 +126,16 @@ impl<T> ArenaNode<T> {
     /// then it will be set to the newly created arena. Maintains a circuluarly linked list.
     ///
     /// Needs to acquire a write lock (only competes with other calls to this function).
-    fn new_in(genvec: &GenVec<T>, capacity: usize) {
+    fn new_in(genvec: &GenVec<T>) -> *mut Self {
         let ret = Box::into_raw(Box::new(Self {
             generation: 0.into(),
-            inner: Vec::from_iter((0..capacity).map(|i| Inner {
+            inner: Vec::from_iter((0..genvec.arena_cap).map(|i| Inner {
                 epoch: 0.into(),
                 next: (i + 1).into(),
                 refs: 0.into(),
                 item: MaybeUninit::uninit().into(),
             })),
-            free_cnt: capacity.into(),
+            free_cnt: genvec.arena_cap.into(),
             free_head: 0.into(),
             next: AtomicPtr::new(std::ptr::null_mut()),
         }));
@@ -155,6 +165,7 @@ impl<T> ArenaNode<T> {
             head.next.store(ret, Ordering::Relaxed);
             genvec.arena.store(ret, Ordering::Release);
         }
+        ret
     }
 }
 
@@ -233,7 +244,7 @@ impl<'a, T> Weak<'a, T> {
 
         let inner = &self.source.inner[self.index];
         if inner.epoch.load(Ordering::Acquire) != self.epoch {
-            self.source.dec_ref(self.index);
+            self.source.dec_ref(self.index, Ordering::Relaxed);
             return None;
         };
         Some(Ref {
@@ -264,20 +275,20 @@ impl<T> GenVec<T> {
         let ret = Self {
             arena_init_lock: 0.into(),
             arena: AtomicPtr::new(std::ptr::null_mut()),
+            arena_cap: capacity,
         };
         for _ in 0..arenas {
-            ArenaNode::new_in(&ret, capacity);
+            ArenaNode::new_in(&ret);
         }
         ret
     }
 
     /// insert an object into the GenVec.
     ///
-    /// if the allocation fails due to lack of capacity, the item will be returned in the `Err()`
-    /// variant
+    /// if the allocation fails due to lack of capacity, a new arena will be created.
     #[must_use]
-    pub fn alloc(&self, item: T) -> Result<Ref<T>, T> {
-        let orig_head = self.arena.load(Ordering::Acquire);
+    pub fn alloc(&self, item: T) -> Ref<T> {
+        let mut orig_head = self.arena.load(Ordering::Acquire);
         let mut head = orig_head;
         loop {
             'attempt: {
@@ -309,22 +320,26 @@ impl<T> GenVec<T> {
                     *lock = slot.next.get().read();
                     let generation = head.generation.get();
                     *generation = (*generation).wrapping_add(1);
-                    slot.epoch.store(generation.read(), Ordering::Release);
+                    slot.epoch.store(generation.read(), Ordering::Relaxed);
                 }
                 slot.refs
                     .fetch_add(ArenaNode::<T>::DROP_BIT | 1, Ordering::Release);
-                return Ok(Ref {
+                return Ref {
                     index: idx,
                     source: head,
-                });
+                };
             };
 
             // Safety: linked list is valid
             let next = unsafe { (*head).next.load(Ordering::Acquire) };
             if orig_head == next {
-                return Err(item);
+                // another thread can still win a race here, and theoretically even fill it
+                // entirely before the next loop.
+                head = ArenaNode::new_in(self);
+                orig_head = head;
+            } else {
+                head = next;
             }
-            head = next;
         }
     }
 
@@ -380,7 +395,7 @@ impl<T> Clone for Ref<'_, T> {
 
 impl<T> Drop for Ref<'_, T> {
     fn drop(&mut self) {
-        self.source.dec_ref(self.index);
+        self.source.dec_ref(self.index, Ordering::Release);
     }
 }
 
@@ -404,14 +419,14 @@ mod test {
     #[test]
     fn allocate_single() {
         let allocator = GenVec::new(1, 1);
-        let item = allocator.alloc(42).unwrap();
+        let item = allocator.alloc(42);
         assert_eq!(*item, 42)
     }
 
     #[test]
     fn make_weak_reference() {
         let allocator = GenVec::new(1, 1);
-        let item = allocator.alloc(42).unwrap();
+        let item = allocator.alloc(42);
         let weak = item.weak();
         assert_eq!(*weak.upgrade().unwrap(), 42);
         std::mem::drop(item)
@@ -420,7 +435,7 @@ mod test {
     #[test]
     fn no_strong_references_invalidates_weak_references() {
         let allocator = GenVec::new(1, 1);
-        let item = allocator.alloc(42).unwrap();
+        let item = allocator.alloc(42);
         let weak = item.weak();
         std::mem::drop(item);
         assert!(weak.upgrade().is_none());
@@ -429,7 +444,7 @@ mod test {
     #[test]
     fn strong_references_keep_alive() {
         let allocator = GenVec::new(1, 1);
-        let item = allocator.alloc(42).unwrap();
+        let item = allocator.alloc(42);
         let weak = item.weak();
         let item_dup = item.clone();
         std::mem::drop(item);
@@ -442,23 +457,23 @@ mod test {
     #[test]
     fn dropping_reference_frees_space() {
         let allocator = GenVec::new(1, 1);
-        let item = allocator.alloc(42).unwrap();
+        let item = allocator.alloc(42);
 
-        assert!(allocator.alloc(33).is_err());
+        let _ = allocator.alloc(33);
 
         std::mem::drop(item);
 
-        let item = allocator.alloc(23).unwrap();
+        let item = allocator.alloc(23);
         assert_eq!(*item, 23)
     }
 
     #[test]
     fn weak_reference_fails_on_replacement() {
         let allocator = GenVec::new(1, 1);
-        let item = allocator.alloc(42).unwrap();
+        let item = allocator.alloc(42);
         let weak = item.weak();
         std::mem::drop(item);
-        let new_item = allocator.alloc(33).unwrap();
+        let new_item = allocator.alloc(33);
         assert!(weak.upgrade().is_none());
         std::mem::drop(new_item)
     }
@@ -478,7 +493,7 @@ mod test {
             let mut rand = fastrand::Rng::with_seed(12345 + thread_id as u64);
             let mut refs = Vec::from_iter(
                 (0..(2 * size / thread_cnt))
-                    .filter_map(|_| allocator.alloc(epoch.fetch_add(1, Ordering::Relaxed)).ok()),
+                    .map(|_| allocator.alloc(epoch.fetch_add(1, Ordering::Relaxed))),
             );
             let mut weaks = Vec::with_capacity(3 * size);
             let mut cnt = 100_000;
@@ -501,9 +516,7 @@ mod test {
                         weaks.push((tref.weak(), **tref));
                     }
                     6 if refs.len() < size => {
-                        let Ok(res) = allocator.alloc(epoch.fetch_add(1, Ordering::Relaxed)) else {
-                            continue;
-                        };
+                        let res = allocator.alloc(epoch.fetch_add(1, Ordering::Relaxed));
                         refs.push(res);
                     }
                     7 if refs.len() < size && refs.len() > 0 => {

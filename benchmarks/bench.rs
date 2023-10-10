@@ -25,7 +25,7 @@ mod traits {
 
     impl<'a, T> Allocator<'a, T, sync::Ref<'a, T>> for sync::GenVec<T> {
         fn alloc(&'a self, val: T) -> Option<sync::Ref<'a, T>> {
-            sync::GenVec::<T>::alloc(self, val).ok()
+            Some(sync::GenVec::<T>::alloc(self, val))
         }
     }
 
@@ -98,8 +98,8 @@ use traits::*;
 fn task<'a, A, T, R, W, F>(
     allocator: &'a A,
     rand: &mut fastrand::Rng,
-    refs: &mut Vec<R>,
-    weaks: &mut Vec<(W, T)>,
+    refs: (&mut Vec<R>, &mut Vec<R>),
+    weaks: (&mut Vec<(W, T)>, &mut Vec<(W, T)>),
     size: usize,
     val: F,
 ) -> bool
@@ -111,6 +111,13 @@ where
     W: RefCountWeak<'a, T, R>,
     A: Allocator<'a, T, R>,
 {
+    let (refs, weaks) = match rand.u8(0..=3) {
+        0 => (refs.0, weaks.0),
+        1 => (refs.1, weaks.0),
+        2 => (refs.1, weaks.1),
+        3 => (refs.0, weaks.1),
+        _ => unreachable!(),
+    };
     match rand.u8(0..=7) {
         0 if refs.len() > 0 => {
             let _ = refs.swap_remove(rand.usize(0..refs.len()));
@@ -156,15 +163,22 @@ fn fuzz() {
         let mut epoch = rand.usize(..);
         let mut cnt = ITER_CNT_SYNC;
         while cnt > 0 {
-            let mut lock = match avec[rand.usize(0..(avec.len()))].lock() {
+            let idx_1 = rand.usize(0..(avec.len() - 1));
+            let idx_2 = rand.usize((idx_1 + 1)..avec.len());
+            let mut lock_1 = match avec[idx_1].lock() {
                 Ok(l) => l,
-                Err(poison) => panic!("poison: {poison}"),
+                Err(_) => panic!(),
             };
-            let (weaks, refs) = &mut *lock;
-            let res = task(allocator, &mut rand, refs, weaks, size, || {
+            let mut lock_2 = match avec[idx_2].lock() {
+                Ok(l) => l,
+                Err(_) => panic!(),
+            };
+            let (weaks_1, refs_1) = &mut *lock_1;
+            let (weaks_2, refs_2) = &mut *lock_2;
+            let res = task(allocator, &mut rand, (refs_1, refs_2), (weaks_1, weaks_2), size, || {
                 inc!(epoch).into()
             });
-            drop(lock);
+            drop(lock_1);
             if res {
                 cnt -= 1
             }
@@ -180,7 +194,7 @@ fn fuzz() {
         Mutex::new((
             Vec::with_capacity(3 * SIZE_SYNC),
             Vec::from_iter(
-                (0..(2 * SIZE_SYNC / tcnt)).filter_map(|_| allocator.alloc(inc!(epoch).into()).ok()),
+                (0..(2 * SIZE_SYNC / tcnt)).map(|_| allocator.alloc(inc!(epoch).into())),
             ),
         ))
     }));
@@ -195,11 +209,12 @@ fn fuzz_alloc() {
     fn ttask(thread_id: usize, thread_cnt: usize, size: usize) {
         let mut rand = fastrand::Rng::with_seed(12345 + thread_id as u64);
         let mut epoch = rand.usize(..);
-        let mut refs = Vec::from_iter((0..(2 * size / thread_cnt)).map(|_| Arc::new(inc!(epoch))));
-        let mut weaks = Vec::with_capacity(3 * size);
+        let mut _refs = Vec::from_iter((0..(2 * size / thread_cnt)).map(|_| Arc::new(inc!(epoch))));
+        // let mut weaks = Vec::with_capacity(3 * size);
         let mut cnt = ITER_CNT_SYNC;
         while cnt > 0 {
-            let res = task(&(), &mut rand, &mut refs, &mut weaks, size, || inc!(epoch));
+            // let res = task(&(), &mut rand, &mut refs, &mut weaks, size, || inc!(epoch));
+            let res = true;
             if res {
                 cnt -= 1;
             }
